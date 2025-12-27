@@ -4,8 +4,19 @@
 #include <limits>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 
 #include <immintrin.h> // AVX2 / AVX-512 等
+
+//测量
+std::atomic<std::uint64_t> Solution::dist_counter_{0};
+std::atomic<bool> Solution::dist_count_enabled_{false};
+void Solution::enable_dist_counter(bool on) {
+    dist_count_enabled_.store(on, std::memory_order_relaxed);
+}
+void Solution::reset_dist_counter(){ dist_counter_.store(0, std::memory_order_relaxed); }
+std::uint64_t Solution::get_dist_counter(){ return dist_counter_.load(std::memory_order_relaxed); }
+
 
 // 预取指令宏
 #define PREFETCH(addr) _mm_prefetch((const char*)(addr), _MM_HINT_T0)
@@ -34,6 +45,9 @@ void Solution::quantize_vec(const float* src, int16_t* dst) const {
 
 // AVX2 版本的 SQ16 L2 距离，如果没有 AVX2 就退化为标量
 float Solution::dist_sq16(const int16_t* d1, const int16_t* d2) const {
+    if (dist_count_enabled_.load(std::memory_order_relaxed)) {
+        dist_counter_.fetch_add(1, std::memory_order_relaxed);
+    }
 #ifdef __AVX2__
     int d = dim_aligned_;
     __m256i sum_i32 = _mm256_setzero_si256();
@@ -139,7 +153,7 @@ std::vector<Solution::Pair> Solution::search_layer_with_dist(
     std::priority_queue<Pair, std::vector<Pair>, decltype(cmpMin)> cand(cmpMin); // 候选集 C（小根堆）
     std::priority_queue<Pair, std::vector<Pair>, decltype(cmpMax)> Bk(cmpMax);   // 答案集 Bk（大根堆）
 
-    const float gamma = 0.19f;
+    const float gamma = gamma_;
 
     // 初始化 visited
     if (visited_.empty()) {
@@ -164,7 +178,7 @@ std::vector<Solution::Pair> Solution::search_layer_with_dist(
         float dist_k = Bk.top().first;
         float bound  = (1.0f + gamma) * dist_k;
 
-        // 老师说：如果 C 中弹出来的点已经大于 (1+gamma)*dist_k，可以直接停止
+        // 如果 C 中弹出来的点已经大于 (1+gamma)*dist_k，可以直接停止
         if (curPair.first > bound) break;
 
         IdType curId = curPair.second;
@@ -262,6 +276,9 @@ void Solution::select_neighbors_heuristic(std::vector<Pair>& candidates,
 // ======================= Build Process =======================
 
 void Solution::build(int dim, const std::vector<float>& base_flat) {
+    if (const char* s = std::getenv("M0"))   M0_ = std::atoi(s);
+    if (const char* s = std::getenv("EFC"))  efC_ = std::atoi(s);
+    if (const char* s = std::getenv("GAMMA")) gamma_ = std::atof(s);
     dim_ = dim;
     N_   = (int)(base_flat.size() / dim_);
     if (N_ <= 0) return;
