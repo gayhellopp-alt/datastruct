@@ -28,6 +28,11 @@ public:
     // q: 查询向量；res: 输出前 10 个近邻 id（main.cpp 的 TOPK=10）
     void search(const std::vector<float>& q, int* res);
 
+    //测量使用
+    static void reset_dist_counter();
+    static std::uint64_t get_dist_counter();
+    static void enable_dist_counter(bool on);
+
 private:
     using IdType   = int;
     using DistType = float;
@@ -46,9 +51,10 @@ private:
     int maxLevel_   = -1;
     int enterPoint_ = -1;
     int M_   = 16;    // 上层最大度
-    int M0_  = 256;    // 底层最大度
-    int efC_ = 256;   // 构建时 efConstruction
+    int M0_  = 54;    // 底层最大度
+    int efC_ = 500;   // 构建时 efConstruction
     int efS_ = 10;   // 搜索时 efSearch
+    float gamma_ = 0.21f;
 
     // 原始图结构：graph_[level][node] = 邻接表
     std::vector<std::vector<std::vector<int>>> graph_;
@@ -63,6 +69,10 @@ private:
     // 全局 visited（仅搜索阶段用），版本号技巧避免每次清零
     mutable std::vector<std::uint32_t> visited_;
     mutable std::uint32_t visitedToken_ = 1u;
+
+    //测量使用
+    static std::atomic<std::uint64_t> dist_counter_;
+    static std::atomic<bool> dist_count_enabled_;
 
     std::mt19937 rng_;
 
@@ -110,6 +120,9 @@ private:
                          std::priority_queue<Pair>& topRes,
                          std::vector<std::uint32_t>& visited_local,
                          std::uint32_t& visitedTokenLocal);
+
+
+    
 };
 
 #endif // MYSOLUTION_H
