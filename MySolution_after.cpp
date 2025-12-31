@@ -19,7 +19,11 @@ std::uint64_t Solution::get_dist_counter(){ return dist_counter_.load(std::memor
 
 
 // 预取指令宏
+#if ABLATE_DISABLE_PREFETCH
+#define PREFETCH(addr) ((void)0)
+#else
 #define PREFETCH(addr) _mm_prefetch((const char*)(addr), _MM_HINT_T0)
+#endif
 
 // ======================= 构造函数 =======================
 
@@ -92,6 +96,9 @@ float Solution::dist_sq16(const int16_t* d1, const int16_t* d2) const {
 
 float Solution::dist2_float(const float* a, const float* b) const {
     // 备用的 float L2（目前几乎不用）
+    if (dist_count_enabled_.load(std::memory_order_relaxed)) {
+        dist_counter_.fetch_add(1, std::memory_order_relaxed);
+    }
     float s = 0.0f;
     for (int i = 0; i < dim_; ++i) {
         float d = a[i] - b[i];
@@ -113,23 +120,23 @@ int Solution::sampleLevel() {
 
 // ----------------- Greedy Search (Top Layers) -----------------
 
-int Solution::greedy_search_layer(const int16_t* q_sq, int ep, int level) const {
+int Solution::greedy_search_layer(const VecType* q_vec, int ep, int level) const {
     IdType cur = ep;
-    float curDist = dist_sq16(q_sq, getVecSQ(cur));
+    float curDist = dist_vec(q_vec, getVec(cur));
     bool changed = true;
 
     while (changed) {
         changed = false;
         const auto& neigh = graph_[level][cur]; // 上层不扁平化
         
-        if (!neigh.empty()) PREFETCH(getVecSQ(neigh[0]));
+        if (!neigh.empty()) PREFETCH(getVec(neigh[0]));
 
         for (std::size_t i = 0; i < neigh.size(); ++i) {
             int nb = neigh[i];
             if (i + 1 < neigh.size()) {
-                PREFETCH(getVecSQ(neigh[i + 1]));
+                PREFETCH(getVec(neigh[i + 1]));
             }
-            float d = dist_sq16(q_sq, getVecSQ(nb));
+            float d = dist_vec(q_vec, getVec(nb));
             if (d < curDist) {
                 curDist = d;
                 cur = nb;
@@ -143,7 +150,7 @@ int Solution::greedy_search_layer(const int16_t* q_sq, int ep, int level) const 
 // ----------------- Beam Search (Bottom Layer, Search API) -----------------
 
 std::vector<Solution::Pair> Solution::search_layer_with_dist(
-    const int16_t* q_sq, int ep, int K, int level) const
+    const VecType* q_vec, int ep, int K, int level) const
 {
     if (K > N_) K = N_;
 
@@ -166,7 +173,7 @@ std::vector<Solution::Pair> Solution::search_layer_with_dist(
     }
 
     visited_[ep] = visitedToken_;
-    float dist_ep = dist_sq16(q_sq, getVecSQ(ep));
+    float dist_ep = dist_vec(q_vec, getVec(ep));
     cand.push({dist_ep, ep});
     Bk.push({dist_ep, ep});
 
@@ -179,7 +186,9 @@ std::vector<Solution::Pair> Solution::search_layer_with_dist(
         float bound  = (1.0f + gamma) * dist_k;
 
         // 如果 C 中弹出来的点已经大于 (1+gamma)*dist_k，可以直接停止
+#if !ABLATE_DISABLE_GAMMA_EARLY_STOP
         if (curPair.first > bound) break;
+#endif
 
         IdType curId = curPair.second;
 
@@ -197,20 +206,20 @@ std::vector<Solution::Pair> Solution::search_layer_with_dist(
             size = (int)vec.size();
         }
 
-        if (size > 0) PREFETCH(getVecSQ(neighbors_ptr[0]));
+        if (size > 0) PREFETCH(getVec(neighbors_ptr[0]));
 
         for (int i = 0; i < size; ++i) {
             int nb = neighbors_ptr[i];
 
             if (i + 1 < size) {
                 int next_nb = neighbors_ptr[i + 1];
-                PREFETCH(getVecSQ(next_nb));
+                PREFETCH(getVec(next_nb));
             }
 
             if (visited_[nb] == visitedToken_) continue;
             visited_[nb] = visitedToken_;
 
-            float d = dist_sq16(q_sq, getVecSQ(nb));
+            float d = dist_vec(q_vec, getVec(nb));
 
             // 1) Bk 的答案集照常更新（top-K）
             if ((int)Bk.size() < K || d < Bk.top().first) {
@@ -225,7 +234,11 @@ std::vector<Solution::Pair> Solution::search_layer_with_dist(
             bound  = (1.0f + gamma) * dist_k;
 
             // 2) 候选集 C 的更新策略：仅当 d <= (1+gamma)*dist_k 时才放入 C
+#if ABLATE_CAND_ALWAYS_ENQUEUE
+            if (true) {
+#else
             if (d <= bound) {
+#endif
                 cand.push({d, nb});
             }
         }
@@ -261,9 +274,9 @@ void Solution::select_neighbors_heuristic(std::vector<Pair>& candidates,
         if ((int)out.size() >= M) break;
         int v = c.second;
         bool ok = true;
-        const int16_t* vVec = getVecSQ(v);
+        const VecType* vVec = getVec(v);
         for (int u : out) {
-            float d = dist_sq16(getVecSQ(u), vVec);
+            float d = dist_vec(getVec(u), vVec);
             if (d < c.first) { // RNG 规则
                 ok = false;
                 break;
@@ -284,6 +297,10 @@ void Solution::build(int dim, const std::vector<float>& base_flat) {
     if (N_ <= 0) return;
 
     // 1. 初始化量化参数
+#if ABLATE_USE_FLOAT_DISTANCE
+    dim_aligned_ = dim_;
+    data_float_.assign(base_flat.begin(), base_flat.end());
+#else
     dim_aligned_ = (dim_ + 15) / 16 * 16;
     data_sq_.assign((std::size_t)N_ * dim_aligned_, 0);
 
@@ -303,6 +320,7 @@ void Solution::build(int dim, const std::vector<float>& base_flat) {
         int16_t* dst     = &data_sq_[(std::size_t)i * dim_aligned_];
         quantize_vec(src, dst);
     }
+#endif
 
     // 3. 初始化层数、graph、锁
     nodeLevel_.assign(N_, 0);
@@ -319,10 +337,12 @@ void Solution::build(int dim, const std::vector<float>& base_flat) {
         graph_[l].resize(N_);
     }
 
+#if !ABLATE_SERIAL_BUILD
     nodeLocks_.resize(N_);
     for (int i = 0; i < N_; ++i) {
         nodeLocks_[i] = std::make_unique<std::mutex>();
     }
+#endif
 
     maxLevel_   = -1;
     enterPoint_ = -1;
@@ -335,7 +355,18 @@ void Solution::build(int dim, const std::vector<float>& base_flat) {
                   return base_flat[(std::size_t)a * dim_] < base_flat[(std::size_t)b * dim_];
               });
 
-    // 5. 并行插入
+    // 5. 插入
+#if ABLATE_SERIAL_BUILD
+    {
+        std::vector<std::uint32_t> visited_local;
+        std::uint32_t token_local = 1u;
+        for (int idx = 0; idx < N_; ++idx) {
+            int u = buildOrder[idx];
+            const VecType* vec = getVec(u);
+            addPointMT(u, vec, visited_local, token_local);
+        }
+    }
+#else
     std::atomic<int> nextIdx(0);
     int nThreads = (int)std::thread::hardware_concurrency();
     if (nThreads <= 0) nThreads = 4;
@@ -348,16 +379,18 @@ void Solution::build(int dim, const std::vector<float>& base_flat) {
             int idx = nextIdx.fetch_add(1);
             if (idx >= N_) break;
             int u = buildOrder[idx];
-            const int16_t* vecSQ = getVecSQ(u);
-            addPointMT(u, vecSQ, visited_local, token_local);
+            const VecType* vec = getVec(u);
+            addPointMT(u, vec, visited_local, token_local);
         }
     };
 
     for (int t = 0; t < nThreads; ++t) threads.emplace_back(worker);
     for (auto& th : threads) th.join();
+#endif
 
     // ======================= Post-process: reverse-edge injection (Level 0) =======================
     // build 完成后做 1~2 轮：补全 u->v 的反向边 v->u，并在超限时剪枝（MIRAGE 的 R 轮思想低成本版）
+#if !ABLATE_DISABLE_POST_PROCESS
     auto prune_level0 = [&](int v) {
         auto& nbv = graph_[0][v];
 
@@ -379,11 +412,11 @@ void Solution::build(int dim, const std::vector<float>& base_flat) {
         // 3) RNG-style 剪枝
         std::vector<Pair> cand;
         cand.reserve(nbv.size());
-        const int16_t* vVec = getVecSQ(v);
+        const VecType* vVec = getVec(v);
         for (int other : nbv) {
             // 再保险一次
             if (other < 0 || other >= N_ || other == v) continue;
-            float d = dist_sq16(getVecSQ(other), vVec);
+            float d = dist_vec(getVec(other), vVec);
             cand.emplace_back(d, other);
         }
         std::vector<int> pruned;
@@ -423,6 +456,7 @@ void Solution::build(int dim, const std::vector<float>& base_flat) {
         // 最后全局再清理一遍（更干净、更稳）
         for (int v = 0; v < N_; ++v) prune_level0(v);
     }
+#endif
 
     // 6. 扁平化 Level 0
     int stride = M0_ + 1;
@@ -445,7 +479,7 @@ void Solution::build(int dim, const std::vector<float>& base_flat) {
 
 // ----------------- 构建时的 search_layer_mt（线程本地 visited） -----------------
 
-void Solution::search_layer_mt(const int16_t* q_sq,
+void Solution::search_layer_mt(const VecType* q_vec,
                                int ep,
                                int ef,
                                int level,
@@ -470,7 +504,7 @@ void Solution::search_layer_mt(const int16_t* q_sq,
     }
 
     visited_local[ep] = visitedTokenLocal;
-    float dist_ep = dist_sq16(q_sq, getVecSQ(ep));
+    float dist_ep = dist_vec(q_vec, getVec(ep));
     cand.push({dist_ep, ep});
     topRes.push({dist_ep, ep});
     DistType topResLimit = dist_ep;
@@ -484,23 +518,27 @@ void Solution::search_layer_mt(const int16_t* q_sq,
 
         // 为了避免和其他线程竞争锁，只在拷贝邻接表时加锁
         std::vector<int> neighbors;
+#if ABLATE_SERIAL_BUILD
+        neighbors = graph_[level][curId];
+#else
         {
             std::lock_guard<std::mutex> lk(*nodeLocks_[curId]);
             neighbors = graph_[level][curId];
         }
+#endif
 
-        if (!neighbors.empty()) PREFETCH(getVecSQ(neighbors[0]));
+        if (!neighbors.empty()) PREFETCH(getVec(neighbors[0]));
 
         for (std::size_t i = 0; i < neighbors.size(); ++i) {
             int nb = neighbors[i];
             if (i + 1 < neighbors.size()) {
-                PREFETCH(getVecSQ(neighbors[i + 1]));
+                PREFETCH(getVec(neighbors[i + 1]));
             }
 
             if (visited_local[nb] == visitedTokenLocal) continue;
             visited_local[nb] = visitedTokenLocal;
 
-            float d = dist_sq16(q_sq, getVecSQ(nb));
+            float d = dist_vec(q_vec, getVec(nb));
 
             if ((int)topRes.size() < ef || d < topResLimit) {
                 cand.push({d, nb});
@@ -517,13 +555,20 @@ void Solution::search_layer_mt(const int16_t* q_sq,
 // ----------------- addPointMT：并行插入一个节点 -----------------
 
 void Solution::addPointMT(int cur,
-                          const int16_t* curVecSQ,
+                          const VecType* curVec,
                           std::vector<std::uint32_t>& visited_local,
                           std::uint32_t& visitedTokenLocal)
 {
     int level = nodeLevel_[cur];
 
     // 第一个点：特殊处理
+#if ABLATE_SERIAL_BUILD
+    if (enterPoint_ < 0 || maxLevel_ < 0) {
+        enterPoint_ = cur;
+        maxLevel_   = level;
+        return;
+    }
+#else
     {
         std::lock_guard<std::mutex> g(globalLock_);
         if (enterPoint_ < 0 || maxLevel_ < 0) {
@@ -532,35 +577,49 @@ void Solution::addPointMT(int cur,
             return;
         }
     }
+#endif
 
     int curMaxLevel;
     int ep;
+#if ABLATE_SERIAL_BUILD
+    ep = enterPoint_;
+    curMaxLevel = maxLevel_;
+#else
     {
         std::lock_guard<std::mutex> g(globalLock_);
         ep = enterPoint_;
         curMaxLevel = maxLevel_;
     }
+#endif
 
     // 如果当前点层数超过全局最大层，更新 enterPoint_ / maxLevel_
     if (level > curMaxLevel) {
+#if ABLATE_SERIAL_BUILD
+        if (level > maxLevel_) {
+            maxLevel_   = level;
+            enterPoint_ = cur;
+        }
+        curMaxLevel = maxLevel_;
+#else
         std::lock_guard<std::mutex> g(globalLock_);
         if (level > maxLevel_) {
             maxLevel_   = level;
             enterPoint_ = cur;
         }
         curMaxLevel = maxLevel_;
+#endif
     }
 
     // 1) 从最高层到 level+1 做 greedy search
-    const int16_t* q_sq = curVecSQ;
+    const VecType* q_vec = curVec;
     for (int l = curMaxLevel; l > level; --l) {
-        ep = greedy_search_layer(q_sq, ep, l);
+        ep = greedy_search_layer(q_vec, ep, l);
     }
 
     // 2) 从 min(level, curMaxLevel) 往下到 0 层，做多层连接
     for (int l = std::min(level, curMaxLevel); l >= 0; --l) {
         std::priority_queue<Pair> topRes;
-        search_layer_mt(q_sq, ep, efC_, l, topRes, visited_local, visitedTokenLocal);
+        search_layer_mt(q_vec, ep, efC_, l, topRes, visited_local, visitedTokenLocal);
 
         // 将 topRes 转为 vector，并按距离升序排序
         std::vector<Pair> layer_cand;
@@ -583,6 +642,38 @@ void Solution::addPointMT(int cur,
             selected.end());
 
         // 把当前点的邻居写入 graph_[l][cur]
+#if ABLATE_SERIAL_BUILD
+        {
+            auto& neigh = graph_[l][cur];
+            neigh.insert(neigh.end(), selected.begin(), selected.end());
+
+            // cur 自己也要去重 + 超限剪枝（你已经加了，保留）
+            if (!neigh.empty()) {
+                std::sort(neigh.begin(), neigh.end());
+                neigh.erase(std::unique(neigh.begin(), neigh.end()), neigh.end());
+            }
+
+            int maxM2 = maxMForLevel(l);
+            if ((int)neigh.size() > maxM2) {
+                std::vector<Pair> cand_cur;
+                cand_cur.reserve(neigh.size());
+                const VecType* curV = getVec(cur);
+                for (int other : neigh) {
+                    if (other < 0 || other >= N_ || other == cur) continue; // 再保险
+                    float d = dist_vec(getVec(other), curV);
+                    cand_cur.emplace_back(d, other);
+                }
+                std::vector<int> pruned;
+                select_neighbors_heuristic(cand_cur, maxM2, pruned);
+                neigh.assign(pruned.begin(), pruned.end());
+
+                // 再过滤一次
+                neigh.erase(std::remove_if(neigh.begin(), neigh.end(),
+                    [&](int x){ return x < 0 || x >= N_ || x == cur; }),
+                    neigh.end());
+            }
+        }
+#else
         {
             std::lock_guard<std::mutex> lk(*nodeLocks_[cur]);
             auto& neigh = graph_[l][cur];
@@ -598,10 +689,10 @@ void Solution::addPointMT(int cur,
             if ((int)neigh.size() > maxM2) {
                 std::vector<Pair> cand_cur;
                 cand_cur.reserve(neigh.size());
-                const int16_t* curV = getVecSQ(cur);
+                const VecType* curV = getVec(cur);
                 for (int other : neigh) {
                     if (other < 0 || other >= N_ || other == cur) continue; // 再保险
-                    float d = dist_sq16(getVecSQ(other), curV);
+                    float d = dist_vec(getVec(other), curV);
                     cand_cur.emplace_back(d, other);
                 }
                 std::vector<int> pruned;
@@ -614,12 +705,13 @@ void Solution::addPointMT(int cur,
                     neigh.end());
             }
         }
+#endif
 
         // 对每个邻居做双向连接，并且如果邻居度超过限制就剪枝
         for (int nb : selected) {
             if (nb < 0 || nb >= N_ || nb == cur) continue; // 保险
+#if ABLATE_SERIAL_BUILD
             {
-                std::lock_guard<std::mutex> lk(*nodeLocks_[nb]);
                 auto& neigh_nb = graph_[l][nb];
                 neigh_nb.push_back(cur);
 
@@ -627,10 +719,10 @@ void Solution::addPointMT(int cur,
                     // 对邻居 nb 的邻接表做一次剪枝
                     std::vector<Pair> cand_nb;
                     cand_nb.reserve(neigh_nb.size());
-                    const int16_t* nbVec = getVecSQ(nb);
+                    const VecType* nbVec = getVec(nb);
                     for (int other : neigh_nb) {
                         if (other < 0 || other >= N_ || other == nb) continue;
-                        float d = dist_sq16(getVecSQ(other), nbVec);
+                        float d = dist_vec(getVec(other), nbVec);
                         cand_nb.emplace_back(d, other);
                     }
                     std::vector<int> pruned;
@@ -643,6 +735,33 @@ void Solution::addPointMT(int cur,
                         neigh_nb.end());
                 }
             }
+#else
+            {
+                std::lock_guard<std::mutex> lk(*nodeLocks_[nb]);
+                auto& neigh_nb = graph_[l][nb];
+                neigh_nb.push_back(cur);
+
+                if ((int)neigh_nb.size() > maxMForLevel(l)) {
+                    // 对邻居 nb 的邻接表做一次剪枝
+                    std::vector<Pair> cand_nb;
+                    cand_nb.reserve(neigh_nb.size());
+                    const VecType* nbVec = getVec(nb);
+                    for (int other : neigh_nb) {
+                        if (other < 0 || other >= N_ || other == nb) continue;
+                        float d = dist_vec(getVec(other), nbVec);
+                        cand_nb.emplace_back(d, other);
+                    }
+                    std::vector<int> pruned;
+                    select_neighbors_heuristic(cand_nb, maxMForLevel(l), pruned);
+                    neigh_nb.assign(pruned.begin(), pruned.end());
+
+                    // 去掉 self/非法（保险）
+                    neigh_nb.erase(std::remove_if(neigh_nb.begin(), neigh_nb.end(),
+                        [&](int x){ return x < 0 || x >= N_ || x == nb; }),
+                        neigh_nb.end());
+                }
+            }
+#endif
         }
 
         // 下一层的起始点设为当前层的一个最近邻（如果有）
@@ -662,9 +781,13 @@ void Solution::search(const std::vector<float>& q, int* res) {
     }
 
     // 1. 量化查询向量
+#if ABLATE_USE_FLOAT_DISTANCE
+    const VecType* qPtr = q.data();
+#else
     std::vector<int16_t> q_sq(dim_aligned_);
     quantize_vec(q.data(), q_sq.data());
-    const int16_t* qPtr = q_sq.data();
+    const VecType* qPtr = q_sq.data();
+#endif
 
     // 2. 从最高层贪心到第 0 层
     int ep;
