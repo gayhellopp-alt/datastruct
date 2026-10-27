@@ -1,0 +1,9 @@
+configuration,build_s,avg_query_ms,median_query_ms,recall_at_10,avg_distance_computations,source_section,dataset_version,evidence
+baseline,424.1,0.758759,0.404159,0.993,13202.77,2.1-2.4,original_glove,course_report
+lid_added,458.369,0.770949,0.405591,0.995,12991.17,2.1,original_glove,course_report
+no_post_process,275.763,0.758213,0.407492,0.994,12970.31,2.2,original_glove,course_report
+no_gamma_early_stop,424.108,1.24146,0.562775,0.994,20611.65,2.3,original_glove,course_report
+cand_always_enqueue,423.097,1.07849,0.562775,0.993,13201.37,2.3,original_glove,course_report
+float_distance,538.806,1.05907,0.57018,0.995,13197.39,2.4,original_glove,course_report
+serial_build,1673.7,0.765464,0.402186,0.993,13201.29,2.4,original_glove,course_report
+no_prefetch,410.667,0.930724,0.498464,0.993,13195.34,2.4,original_glove,course_report

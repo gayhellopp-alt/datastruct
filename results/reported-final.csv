@@ -1,0 +1,4 @@
+setting,dataset_version,recall_at_10,avg_query_ms,avg_distance_computations,distance_count_precision,evidence
+local_final,original_glove,0.996,0.718538,12970,approximate,course_report_final_note
+local_same_code,updated_glove,0.996,0.800284,14362.490,reported,course_report_final_note
+course_grading_server,not_identified_in_final_note,0.9891,1.0577,,not_reported,course_report_final_note

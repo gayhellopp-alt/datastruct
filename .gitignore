@@ -1,0 +1,11 @@
+/build/
+/data/
+/data_o/
+*.o
+*.obj
+*.exe
+groundtruth_top10.txt
+pred_top10.txt
+__pycache__/
+.DS_Store
+Thumbs.db
