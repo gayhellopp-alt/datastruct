@@ -13,6 +13,26 @@
 #include <memory>
 #include <cmath>
 
+// Ablation macros (set to 1 to enable)
+#ifndef ABLATE_DISABLE_GAMMA_EARLY_STOP
+#define ABLATE_DISABLE_GAMMA_EARLY_STOP 0
+#endif
+#ifndef ABLATE_CAND_ALWAYS_ENQUEUE
+#define ABLATE_CAND_ALWAYS_ENQUEUE 0
+#endif
+#ifndef ABLATE_USE_FLOAT_DISTANCE
+#define ABLATE_USE_FLOAT_DISTANCE 0
+#endif
+#ifndef ABLATE_SERIAL_BUILD
+#define ABLATE_SERIAL_BUILD 0
+#endif
+#ifndef ABLATE_DISABLE_POST_PROCESS
+#define ABLATE_DISABLE_POST_PROCESS 0
+#endif
+#ifndef ABLATE_DISABLE_PREFETCH
+#define ABLATE_DISABLE_PREFETCH 0
+#endif
+
 // 保持对齐，方便 SIMD 加载
 #ifdef _MSC_VER
 #define ALIGN(x) __declspec(align(x))
@@ -37,6 +57,11 @@ private:
     using IdType   = int;
     using DistType = float;
     using Pair     = std::pair<DistType, IdType>;
+#if ABLATE_USE_FLOAT_DISTANCE
+    using VecType  = float;
+#else
+    using VecType  = int16_t;
+#endif
 
     int dim_ = 0;
     int N_   = 0;
@@ -46,6 +71,7 @@ private:
     float min_val_      = 0.0f;   // 全局最小值
     float diff_scale_   = 0.0f;   // 量化缩放因子
     std::vector<int16_t> data_sq_; // 量化后的数据 N * dim_aligned_
+    std::vector<float> data_float_; // float 数据 N * dim
 
     // 图结构参数
     int maxLevel_   = -1;
@@ -85,8 +111,20 @@ private:
     float dist_sq16(const int16_t* d1, const int16_t* d2) const;
     DistType dist2_float(const float* a, const float* b) const; // 备用（目前基本不用）
 
-    inline const int16_t* getVecSQ(IdType id) const {
+    inline const VecType* getVec(IdType id) const {
+#if ABLATE_USE_FLOAT_DISTANCE
+        return &data_float_[(std::size_t)id * dim_];
+#else
         return &data_sq_[(std::size_t)id * dim_aligned_];
+#endif
+    }
+
+    inline DistType dist_vec(const VecType* a, const VecType* b) const {
+#if ABLATE_USE_FLOAT_DISTANCE
+        return dist2_float(a, b);
+#else
+        return dist_sq16(a, b);
+#endif
     }
 
     // ===== HNSW 结构相关 =====
@@ -94,10 +132,10 @@ private:
     inline int maxMForLevel(int level) const { return (level == 0) ? M0_ : M_; }
 
     // 上层贪心搜索（使用 graph_[level]）
-    int greedy_search_layer(const int16_t* q_sq, int ep, int level) const;
+    int greedy_search_layer(const VecType* q_vec, int ep, int level) const;
 
     // 底层 beam search（搜索接口用；level=0 时会走扁平化图）
-    std::vector<Pair> search_layer_with_dist(const int16_t* q_sq,
+    std::vector<Pair> search_layer_with_dist(const VecType* q_vec,
                                              int ep,
                                              int ef,
                                              int level) const;
@@ -109,11 +147,11 @@ private:
 
     // ===== 并行构建 =====
     void addPointMT(int cur,
-                    const int16_t* curVecSQ,
+                    const VecType* curVec,
                     std::vector<std::uint32_t>& visited_local,
                     std::uint32_t& visitedTokenLocal);
 
-    void search_layer_mt(const int16_t* q_sq,
+    void search_layer_mt(const VecType* q_vec,
                          int ep,
                          int ef,
                          int level,
